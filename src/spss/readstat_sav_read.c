@@ -14,6 +14,7 @@
 #include "../readstat_iconv.h"
 #include "../readstat_convert.h"
 #include "../readstat_malloc.h"
+#include "../readstat_reader.h"
 #include "../CKHashTable.h"
 
 #include "readstat_sav.h"
@@ -124,12 +125,8 @@ typedef struct value_label_s {
 } value_label_t;
 
 readstat_error_t sav_update_progress(sav_ctx_t *ctx);
-static readstat_error_t sav_read_data(sav_ctx_t *ctx);
-static readstat_error_t sav_read_compressed_data(sav_ctx_t *ctx,
-        readstat_error_t (*row_handler)(unsigned char *, size_t, sav_ctx_t *));
-static readstat_error_t sav_read_uncompressed_data(sav_ctx_t *ctx,
-        readstat_error_t (*row_handler)(unsigned char *, size_t, sav_ctx_t *));
-
+static readstat_error_t sav_reader_read_rows(readstat_reader_t *reader, size_t max_rows);
+static void sav_reader_close(readstat_reader_t *reader);
 static readstat_error_t sav_skip_variable_record(sav_ctx_t *ctx);
 static readstat_error_t sav_read_variable_record(sav_ctx_t *ctx);
 
@@ -747,7 +744,7 @@ static readstat_error_t sav_read_dictionary_termination_record(sav_ctx_t *ctx) {
     return retval;
 }
 
-static readstat_error_t sav_process_row(unsigned char *buffer, size_t buffer_len, sav_ctx_t *ctx) {
+readstat_error_t sav_process_row(unsigned char *buffer, size_t buffer_len, sav_ctx_t *ctx) {
     if (ctx->row_offset) {
         ctx->row_offset--;
         return READSTAT_OK;
@@ -837,10 +834,43 @@ done:
     return retval;
 }
 
-static readstat_error_t sav_read_data(sav_ctx_t *ctx) {
+typedef struct sav_rle_state_s {
+    unsigned char *buffer;
+    size_t         buffer_size;
+    size_t         buffer_used;
+    size_t         data_offset;
+    unsigned char *uncompressed_row;
+    size_t         uncompressed_row_len;
+    size_t         uncompressed_offset;
+    struct sav_row_stream_s stream;
+    int            trailing_bytes;
+    int            finished;
+} sav_rle_state_t;
+
+static void sav_rle_state_free(void *ptr) {
+    sav_rle_state_t *state = (sav_rle_state_t *)ptr;
+    if (state == NULL)
+        return;
+    free(state->buffer);
+    free(state->uncompressed_row);
+    free(state);
+}
+
+static readstat_error_t sav_prepare_data(sav_ctx_t *ctx) {
     readstat_error_t retval = READSTAT_OK;
+    readstat_io_t *io = ctx->io;
     size_t longest_string = 256;
     int i;
+
+    if (ctx->data_started)
+        return READSTAT_OK;
+
+    ctx->data_started = 1;
+
+    if (!ctx->handle.value) {
+        ctx->data_finished = 1;
+        return READSTAT_OK;
+    }
 
     for (i=0; i<ctx->var_index;) {
         spss_varinfo_t *info = ctx->varinfo[i];
@@ -858,152 +888,195 @@ static readstat_error_t sav_read_data(sav_ctx_t *ctx) {
 
     if (ctx->raw_string == NULL || ctx->utf8_string == NULL) {
         retval = READSTAT_ERROR_MALLOC;
-        goto done;
+        goto cleanup;
     }
 
     if (ctx->compression == READSTAT_COMPRESS_ROWS) {
-        retval = sav_read_compressed_data(ctx, &sav_process_row);
+        sav_rle_state_t *state = calloc(1, sizeof(sav_rle_state_t));
+        if (state == NULL) {
+            retval = READSTAT_ERROR_MALLOC;
+            goto cleanup;
+        }
+        state->buffer_size = DATA_BUFFER_SIZE;
+        state->buffer = malloc(state->buffer_size);
+        state->uncompressed_row_len = ctx->var_offset * 8;
+        state->uncompressed_row = malloc(state->uncompressed_row_len);
+        state->stream.missing_value = ctx->missing_double;
+        state->stream.bias = ctx->bias;
+        state->stream.bswap = ctx->bswap;
+        if (state->buffer == NULL || (state->uncompressed_row_len && state->uncompressed_row == NULL)) {
+            sav_rle_state_free(state);
+            retval = READSTAT_ERROR_MALLOC;
+            goto cleanup;
+        }
+        ctx->data_state = state;
+        ctx->data_state_free = sav_rle_state_free;
     } else if (ctx->compression == READSTAT_COMPRESS_BINARY) {
 #if HAVE_ZLIB
-        retval = zsav_read_compressed_data(ctx, &sav_process_row);
+        retval = zsav_data_state_init(ctx);
+        if (retval != READSTAT_OK)
+            goto cleanup;
 #else
         retval = READSTAT_ERROR_UNSUPPORTED_COMPRESSION;
+        goto cleanup;
 #endif
     } else {
-        retval = sav_read_uncompressed_data(ctx, &sav_process_row);
-    }
-    if (retval != READSTAT_OK)
-        goto done;
-
-    if (ctx->record_count >= 0 && ctx->current_row != ctx->row_limit) {
-        retval = READSTAT_ERROR_ROW_COUNT_MISMATCH;
-    }
-
-done:
-    return retval;
-}
-
-static readstat_error_t sav_read_uncompressed_data(sav_ctx_t *ctx,
-        readstat_error_t (*row_handler)(unsigned char *, size_t, sav_ctx_t *)) {
-    readstat_error_t retval = READSTAT_OK;
-    readstat_io_t *io = ctx->io;
-    unsigned char *buffer = NULL;
-    size_t bytes_read = 0;
-    size_t buffer_len = ctx->var_offset * 8;
-
-    if ((buffer = readstat_malloc(buffer_len)) == NULL) {
-        retval = READSTAT_ERROR_MALLOC;
-        goto done;
-    }
-
-    if (ctx->row_offset) {
-        if (io->seek(buffer_len * ctx->row_offset, READSTAT_SEEK_CUR, io->io_ctx) == -1) {
-            retval = READSTAT_ERROR_SEEK;
-            goto done;
-        }
-        ctx->row_offset = 0;
-    }
-
-    while (ctx->row_limit == -1 || ctx->current_row < ctx->row_limit) {
-        retval = sav_update_progress(ctx);
-        if (retval != READSTAT_OK)
-            goto done;
-
-        if ((bytes_read = io->read(buffer, buffer_len, io->io_ctx)) != buffer_len)
-            goto done;
-
-        retval = row_handler(buffer, buffer_len, ctx);
-        if (retval != READSTAT_OK)
-            goto done;
-    }
-done:
-    if (buffer)
-        free(buffer);
-
-    return retval;
-}
-
-static readstat_error_t sav_read_compressed_data(sav_ctx_t *ctx,
-        readstat_error_t (*row_handler)(unsigned char *, size_t, sav_ctx_t *)) {
-    readstat_error_t retval = READSTAT_OK;
-    readstat_io_t *io = ctx->io;
-    readstat_off_t data_offset = 0;
-    unsigned char buffer[DATA_BUFFER_SIZE];
-    int buffer_used = 0;
-    int trailing_bytes = 0;
-
-    size_t uncompressed_row_len = ctx->var_offset * 8;
-    readstat_off_t uncompressed_offset = 0;
-    unsigned char *uncompressed_row = NULL;
-
-    struct sav_row_stream_s state = { 
-        .missing_value = ctx->missing_double,
-        .bias = ctx->bias,
-        .bswap = ctx->bswap };
-
-    if (uncompressed_row_len && (uncompressed_row = readstat_malloc(uncompressed_row_len)) == NULL) {
-        retval = READSTAT_ERROR_MALLOC;
-        goto done;
-    }
-
-    while (1) {
-        retval = sav_update_progress(ctx);
-        if (retval != READSTAT_OK)
-            goto done;
-
-        buffer_used = io->read(buffer, sizeof(buffer), io->io_ctx);
-        if (buffer_used == -1 || buffer_used == 0) {
-            if (uncompressed_offset != 0 && (ctx->row_limit < 0 || ctx->current_row < ctx->row_limit)) {
-                /* File ends in the middle of a row */
-                retval = READSTAT_ERROR_PARSE;
+        ctx->data_buffer_len = ctx->var_offset * 8;
+        if (ctx->data_buffer_len) {
+            ctx->data_buffer = readstat_malloc(ctx->data_buffer_len);
+            if (ctx->data_buffer == NULL) {
+                retval = READSTAT_ERROR_MALLOC;
+                goto cleanup;
             }
-            goto done;
         }
-        /* Decode every complete opcode block; a trailing fragment ends the data */
-        trailing_bytes = buffer_used % 8;
-        buffer_used -= trailing_bytes;
 
-        state.status = SAV_ROW_STREAM_HAVE_DATA;
-        data_offset = 0;
+        if (ctx->row_offset) {
+            if (io->seek(ctx->data_buffer_len * ctx->row_offset, READSTAT_SEEK_CUR, io->io_ctx) == -1) {
+                retval = READSTAT_ERROR_SEEK;
+                goto cleanup;
+            }
+            ctx->row_offset = 0;
+        }
+    }
 
-        while (state.status != SAV_ROW_STREAM_NEED_DATA) {
-            state.next_in = &buffer[data_offset];
-            state.avail_in = buffer_used - data_offset;
+    ctx->data_started = 1;
 
-            state.next_out = &uncompressed_row[uncompressed_offset];
-            state.avail_out = uncompressed_row_len - uncompressed_offset;
+cleanup:
+    return retval;
+}
 
-            sav_decompress_row(&state);
+static readstat_error_t sav_read_uncompressed_rows(sav_ctx_t *ctx, size_t max_rows, size_t *out_rows) {
+    readstat_error_t retval = READSTAT_OK;
+    readstat_io_t *io = ctx->io;
 
-            uncompressed_offset = uncompressed_row_len - state.avail_out;
-            data_offset = buffer_used - state.avail_in;
+    *out_rows = 0;
 
-            if (state.status == SAV_ROW_STREAM_FINISHED_ROW) {
-                retval = row_handler(uncompressed_row, uncompressed_row_len, ctx);
+    if (ctx->data_buffer_len == 0) {
+        ctx->data_finished = 1;
+        return READSTAT_OK;
+    }
+
+    while (*out_rows < max_rows && (ctx->row_limit == -1 || ctx->current_row < ctx->row_limit)) {
+        retval = sav_update_progress(ctx);
+        if (retval != READSTAT_OK)
+            goto done;
+
+        if (io->read(ctx->data_buffer, ctx->data_buffer_len, io->io_ctx) != ctx->data_buffer_len) {
+            ctx->data_finished = 1;
+            break;
+        }
+
+        retval = sav_process_row(ctx->data_buffer, ctx->data_buffer_len, ctx);
+        if (retval != READSTAT_OK)
+            goto done;
+
+        (*out_rows)++;
+    }
+
+    if (ctx->row_limit >= 0 && ctx->current_row >= ctx->row_limit)
+        ctx->data_finished = 1;
+
+done:
+    return retval;
+}
+
+static readstat_error_t sav_read_rle_rows(sav_ctx_t *ctx, size_t max_rows, size_t *out_rows) {
+    readstat_error_t retval = READSTAT_OK;
+    readstat_io_t *io = ctx->io;
+    sav_rle_state_t *state = (sav_rle_state_t *)ctx->data_state;
+
+    *out_rows = 0;
+
+    if (state == NULL) {
+        ctx->data_finished = 1;
+        return READSTAT_OK;
+    }
+
+    while (*out_rows < max_rows && !state->finished &&
+            (ctx->row_limit == -1 || ctx->current_row < ctx->row_limit)) {
+        retval = sav_update_progress(ctx);
+        if (retval != READSTAT_OK)
+            goto done;
+
+        if (state->buffer_used == 0 || state->data_offset == state->buffer_used) {
+            ssize_t bytes_read = io->read(state->buffer, state->buffer_size, io->io_ctx);
+            if (bytes_read == -1 || bytes_read == 0) {
+                if (state->uncompressed_offset != 0 &&
+                        (ctx->row_limit < 0 || ctx->current_row < ctx->row_limit)) {
+                    /* File ends in the middle of a row */
+                    retval = READSTAT_ERROR_PARSE;
+                }
+                state->finished = 1;
+                break;
+            }
+            /* Decode every complete opcode block; a trailing fragment ends the data */
+            state->trailing_bytes = bytes_read % 8;
+            state->buffer_used = bytes_read - state->trailing_bytes;
+            state->data_offset = 0;
+        }
+
+        state->stream.status = SAV_ROW_STREAM_HAVE_DATA;
+
+        while (state->stream.status != SAV_ROW_STREAM_NEED_DATA && *out_rows < max_rows) {
+            state->stream.next_in = &state->buffer[state->data_offset];
+            state->stream.avail_in = state->buffer_used - state->data_offset;
+
+            state->stream.next_out = &state->uncompressed_row[state->uncompressed_offset];
+            state->stream.avail_out = state->uncompressed_row_len - state->uncompressed_offset;
+
+            sav_decompress_row(&state->stream);
+
+            state->uncompressed_offset = state->uncompressed_row_len - state->stream.avail_out;
+            state->data_offset = state->buffer_used - state->stream.avail_in;
+
+            if (state->stream.status == SAV_ROW_STREAM_FINISHED_ROW) {
+                retval = sav_process_row(state->uncompressed_row, state->uncompressed_row_len, ctx);
                 if (retval != READSTAT_OK)
                     goto done;
 
-                uncompressed_offset = 0;
+                state->uncompressed_offset = 0;
+                (*out_rows)++;
+
+                if (ctx->row_limit >= 0 && ctx->current_row >= ctx->row_limit) {
+                    state->finished = 1;
+                    break;
+                }
             }
 
-            if (state.status == SAV_ROW_STREAM_FINISHED_ALL)
-                goto done;
-            if (ctx->row_limit > 0 && ctx->current_row == ctx->row_limit)
-                goto done;
+            if (state->stream.status == SAV_ROW_STREAM_FINISHED_ALL) {
+                state->finished = 1;
+                break;
+            }
         }
-        if (trailing_bytes) {
-            if (uncompressed_offset != 0 && (ctx->row_limit < 0 || ctx->current_row < ctx->row_limit)) {
+        if (state->trailing_bytes) {
+            if (state->uncompressed_offset != 0 &&
+                    (ctx->row_limit < 0 || ctx->current_row < ctx->row_limit)) {
                 retval = READSTAT_ERROR_PARSE;
             }
-            goto done;
+            state->finished = 1;
+            break;
         }
     }
 
-done:
-    if (uncompressed_row)
-        free(uncompressed_row);
+    if (state->finished)
+        ctx->data_finished = 1;
 
+done:
     return retval;
+}
+
+static readstat_error_t sav_read_rows(sav_ctx_t *ctx, size_t max_rows, size_t *out_rows) {
+    if (ctx->compression == READSTAT_COMPRESS_ROWS)
+        return sav_read_rle_rows(ctx, max_rows, out_rows);
+    if (ctx->compression == READSTAT_COMPRESS_BINARY) {
+#if HAVE_ZLIB
+        return zsav_read_rows(ctx, max_rows, out_rows);
+#else
+        *out_rows = 0;
+        return READSTAT_ERROR_UNSUPPORTED_COMPRESSION;
+#endif
+    }
+    return sav_read_uncompressed_rows(ctx, max_rows, out_rows);
 }
 
 static readstat_error_t sav_parse_machine_integer_info_record(const void *data, size_t data_len, sav_ctx_t *ctx) {
@@ -1744,15 +1817,18 @@ cleanup:
     return retval;
 }
 
-readstat_error_t readstat_parse_sav(readstat_parser_t *parser, const char *path, void *user_ctx) {
+readstat_reader_t *readstat_sav_reader_open(readstat_parser_t *parser, const char *path,
+        void *user_ctx, readstat_error_t *out_error) {
     readstat_error_t retval = READSTAT_OK;
     readstat_io_t *io = parser->io;
     sav_file_header_record_t header;
     sav_ctx_t *ctx = NULL;
     size_t file_size = 0;
-    
+    readstat_reader_t *reader = NULL;
+
     if (io->open(path, io->io_ctx) == -1) {
-        return READSTAT_ERROR_OPEN;
+        retval = READSTAT_ERROR_OPEN;
+        goto cleanup;
     }
 
     file_size = io->seek(0, READSTAT_SEEK_END, io->io_ctx);
@@ -1791,12 +1867,12 @@ readstat_error_t readstat_parse_sav(readstat_parser_t *parser, const char *path,
             ctx->row_offset = ctx->record_count;
         }
         ctx->row_limit = record_count_after_skipping;
-        if (parser->row_limit > 0 && parser->row_limit < record_count_after_skipping) 
+        if (parser->row_limit > 0 && parser->row_limit < record_count_after_skipping)
             ctx->row_limit = parser->row_limit;
     } else if (parser->row_limit > 0) {
         ctx->row_limit = parser->row_limit;
     }
-    
+
     /* ignore errors */
     sav_parse_timestamp(ctx, &header);
 
@@ -1805,7 +1881,7 @@ readstat_error_t readstat_parse_sav(readstat_parser_t *parser, const char *path,
 
     if ((retval = sav_setup_converter(ctx)) != READSTAT_OK)
         goto cleanup;
-    
+
     if (io->seek(sizeof(sav_file_header_record_t), READSTAT_SEEK_SET, io->io_ctx) == -1) {
         retval = READSTAT_ERROR_SEEK;
         goto cleanup;
@@ -1816,7 +1892,7 @@ readstat_error_t readstat_parse_sav(readstat_parser_t *parser, const char *path,
 
     if ((retval = sav_parse_records_pass2(ctx)) != READSTAT_OK)
         goto cleanup;
- 
+
     if ((retval = sav_set_n_segments_and_var_count(ctx)) != READSTAT_OK)
         goto cleanup;
 
@@ -1865,17 +1941,13 @@ readstat_error_t readstat_parse_sav(readstat_parser_t *parser, const char *path,
                 spss_varinfo_t *info = (spss_varinfo_t *)ck_str_hash_lookup(sv_name_upper, var_dict);
                 if (info) {
                     free(mr.subvariables[j]);
-                    // mr.subvariables[j] = NULL;
                     if ((mr.subvariables[j] = readstat_malloc(strlen(info->longname) + 1)) == NULL) {
                         retval = READSTAT_ERROR_MALLOC;
                         goto cleanup;
                     }
-                    // mr.subvariables[j][strlen(info->longname)] = '\0';
                     strcpy(mr.subvariables[j], info->longname);
-                    // mr.subvariables[j] = info->longname;
                 }
                 free(sv_name_upper);
-                // sv_name_upper = NULL;
             }
         }
         if (var_dict)
@@ -1896,18 +1968,82 @@ readstat_error_t readstat_parse_sav(readstat_parser_t *parser, const char *path,
     if ((retval = sav_handle_variables(ctx)) != READSTAT_OK)
         goto cleanup;
 
-
     if ((retval = sav_handle_fweight(ctx)) != READSTAT_OK)
         goto cleanup;
 
-    if (ctx->handle.value) {
-        retval = sav_read_data(ctx);
+    if ((retval = sav_prepare_data(ctx)) != READSTAT_OK)
+        goto cleanup;
+
+    reader = readstat_reader_alloc(parser, READSTAT_FILE_FORMAT_SAV, user_ctx);
+    if (reader == NULL) {
+        retval = READSTAT_ERROR_MALLOC;
+        goto cleanup;
     }
-    
+    reader->ctx = ctx;
+    reader->read_rows = sav_reader_read_rows;
+    reader->close = sav_reader_close;
+
+    if (out_error)
+        *out_error = READSTAT_OK;
+
+    return reader;
+
 cleanup:
-    io->close(io->io_ctx);
-    if (ctx)
+    if (ctx) {
+        if (io->io_ctx)
+            io->close(io->io_ctx);
         sav_ctx_free(ctx);
-    
-    return retval;
+    }
+    if (out_error)
+        *out_error = retval;
+
+    return NULL;
+}
+
+static readstat_error_t sav_reader_read_rows(readstat_reader_t *reader, size_t max_rows) {
+    sav_ctx_t *ctx = (sav_ctx_t *)reader->ctx;
+    size_t rows = 0;
+    readstat_error_t retval;
+
+    retval = sav_read_rows(ctx, max_rows, &rows);
+    if (retval != READSTAT_OK)
+        return retval;
+
+    if (ctx->data_finished || rows == 0)
+        reader->eof = 1;
+
+    return READSTAT_OK;
+}
+
+static void sav_reader_close(readstat_reader_t *reader) {
+    sav_ctx_t *ctx = (sav_ctx_t *)reader->ctx;
+
+    if (ctx) {
+        if (ctx->io && ctx->io->io_ctx)
+            ctx->io->close(ctx->io->io_ctx);
+        sav_ctx_free(ctx);
+        reader->ctx = NULL;
+    }
+
+    reader->closed = 1;
+}
+
+readstat_error_t readstat_parse_sav(readstat_parser_t *parser, const char *path, void *user_ctx) {
+    readstat_error_t error = READSTAT_OK;
+    readstat_reader_t *reader = readstat_sav_reader_open(parser, path, user_ctx, &error);
+
+    if (reader == NULL)
+        return error;
+
+    while (!readstat_reader_is_eof(reader)) {
+        error = readstat_reader_read_rows(reader, (size_t)-1);
+        if (error != READSTAT_OK) {
+            readstat_reader_close(reader);
+            return error;
+        }
+    }
+
+    readstat_reader_close(reader);
+
+    return READSTAT_OK;
 }

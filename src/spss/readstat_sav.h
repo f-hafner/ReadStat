@@ -112,6 +112,13 @@ typedef struct sav_ctx_s {
     readstat_compress_t  compression;
     readstat_endian_t   endianness;
     unsigned int   bswap:1;
+
+    void          *data_state;
+    void         (*data_state_free)(void *);
+    int            data_started;
+    int            data_finished;
+    unsigned char *data_buffer;
+    size_t         data_buffer_len;
 } sav_ctx_t;
 
 #define SAV_RECORD_TYPE_VARIABLE                2
@@ -144,6 +151,8 @@ typedef struct sav_ctx_s {
 #define SAV_ENDIANNESS_LITTLE            2
 
 #define SAV_EIGHT_SPACES              "        "
+
+readstat_error_t sav_process_row(unsigned char *buffer, size_t buffer_len, sav_ctx_t *ctx);
 
 sav_ctx_t *sav_ctx_init(sav_file_header_record_t *header, readstat_io_t *io);
 readstat_error_t sav_update_progress(sav_ctx_t *ctx);
