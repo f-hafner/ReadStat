@@ -91,6 +91,10 @@ void sav_ctx_free(sav_ctx_t *ctx) {
         free(ctx->raw_string);
     if (ctx->utf8_string)
         free(ctx->utf8_string);
+    if (ctx->data_buffer)
+        free(ctx->data_buffer);
+    if (ctx->data_state && ctx->data_state_free)
+        ctx->data_state_free(ctx->data_state);
     if (ctx->converter)
         iconv_close(ctx->converter);
     if (ctx->variable_display_values) {
