@@ -418,6 +418,33 @@ readstat_error_t readstat_set_handler_character_encoding(readstat_parser_t *pars
 readstat_error_t readstat_set_row_limit(readstat_parser_t *parser, long row_limit);
 readstat_error_t readstat_set_row_offset(readstat_parser_t *parser, long row_offset);
 
+/* Pull-based reader API.
+ *
+ * readstat_reader_open() parses the file metadata and variables, invokes the
+ * metadata and variable handlers, and leaves the parser positioned at the first
+ * data row. readstat_reader_read_rows() then emits at most max_rows rows using
+ * the value handler. The reader keeps the file handle, format context, and all
+ * parser/decompressor state alive until readstat_reader_close(). The parser is
+ * borrowed: it must stay alive until readstat_reader_close(), and the caller
+ * remains responsible for freeing it.
+ */
+typedef enum readstat_file_format_e {
+    READSTAT_FILE_FORMAT_DTA,
+    READSTAT_FILE_FORMAT_SAV,
+    READSTAT_FILE_FORMAT_POR,
+    READSTAT_FILE_FORMAT_SAS7BDAT,
+    READSTAT_FILE_FORMAT_XPORT
+} readstat_file_format_t;
+
+typedef struct readstat_reader_s readstat_reader_t;
+
+readstat_reader_t *readstat_reader_open(readstat_parser_t *parser,
+        readstat_file_format_t format, const char *path, void *user_ctx,
+        readstat_error_t *out_error);
+readstat_error_t readstat_reader_read_rows(readstat_reader_t *reader, size_t max_rows);
+int readstat_reader_is_eof(const readstat_reader_t *reader);
+void readstat_reader_close(readstat_reader_t *reader);
+
 /* Parse binary / portable files */
 readstat_error_t readstat_parse_dta(readstat_parser_t *parser, const char *path, void *user_ctx);
 readstat_error_t readstat_parse_sav(readstat_parser_t *parser, const char *path, void *user_ctx);
