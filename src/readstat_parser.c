@@ -1,6 +1,7 @@
 
 #include <stdlib.h>
 #include "readstat.h"
+#include "readstat_reader.h"
 #include "readstat_io_unistd.h"
 
 readstat_parser_t *readstat_parser_init(void) {
@@ -118,4 +119,88 @@ readstat_error_t readstat_set_row_limit(readstat_parser_t *parser, long row_limi
 readstat_error_t readstat_set_row_offset(readstat_parser_t *parser, long row_offset) {
     parser->row_offset = row_offset;
     return READSTAT_OK;
+}
+
+readstat_reader_t *readstat_reader_alloc(readstat_parser_t *parser,
+        readstat_file_format_t format, void *user_ctx) {
+    readstat_reader_t *reader = calloc(1, sizeof(readstat_reader_t));
+    if (reader == NULL)
+        return NULL;
+
+    reader->parser = parser;
+    reader->format = format;
+    reader->user_ctx = user_ctx;
+    return reader;
+}
+
+void readstat_reader_free(readstat_reader_t *reader) {
+    if (reader == NULL)
+        return;
+
+    if (!reader->closed && reader->close)
+        reader->close(reader);
+    free(reader);
+}
+
+readstat_reader_t *readstat_reader_open(readstat_parser_t *parser,
+        readstat_file_format_t format, const char *path, void *user_ctx,
+        readstat_error_t *out_error) {
+    readstat_reader_t *reader = NULL;
+    readstat_error_t error = READSTAT_ERROR_PARSE;
+
+    if (parser == NULL) {
+        if (out_error)
+            *out_error = READSTAT_ERROR_PARSE;
+        return NULL;
+    }
+
+    switch (format) {
+        case READSTAT_FILE_FORMAT_DTA:
+            reader = readstat_dta_reader_open(parser, path, user_ctx, &error);
+            break;
+        case READSTAT_FILE_FORMAT_SAV:
+            reader = readstat_sav_reader_open(parser, path, user_ctx, &error);
+            break;
+        case READSTAT_FILE_FORMAT_POR:
+            reader = readstat_por_reader_open(parser, path, user_ctx, &error);
+            break;
+        case READSTAT_FILE_FORMAT_SAS7BDAT:
+            reader = readstat_sas7bdat_reader_open(parser, path, user_ctx, &error);
+            break;
+        case READSTAT_FILE_FORMAT_XPORT:
+            reader = readstat_xport_reader_open(parser, path, user_ctx, &error);
+            break;
+        default:
+            error = READSTAT_ERROR_PARSE;
+            break;
+    }
+
+    if (reader == NULL && out_error)
+        *out_error = error;
+
+    return reader;
+}
+
+readstat_error_t readstat_reader_read_rows(readstat_reader_t *reader, size_t max_rows) {
+    readstat_error_t retval;
+
+    if (reader == NULL)
+        return READSTAT_ERROR_PARSE;
+    if (reader->error != READSTAT_OK)
+        return reader->error;
+    if (reader->eof || max_rows == 0)
+        return READSTAT_OK;
+
+    retval = reader->read_rows(reader, max_rows);
+    if (retval != READSTAT_OK)
+        reader->error = retval;
+    return retval;
+}
+
+int readstat_reader_is_eof(const readstat_reader_t *reader) {
+    return reader == NULL || reader->eof;
+}
+
+void readstat_reader_close(readstat_reader_t *reader) {
+    readstat_reader_free(reader);
 }
